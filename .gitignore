@@ -1,0 +1,24 @@
+# Node.js dependencies
+node_modules/
+
+# Environment secrets — NEVER commit
+.env
+
+# Temporary output files (generated videos, images)
+output/
+
+# Local assets that shouldn't be in source control
+assets/base.mp4
+
+# Cloudinary / upload temp
+*.mp4
+*.png
+*.jpg
+
+# Logs
+npm-debug.log*
+yarn-error.log*
+
+# OS files
+.DS_Store
+Thumbs.db
