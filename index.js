@@ -13,6 +13,7 @@ const cors         = require('cors');
 const bodyParser   = require('body-parser');
 const session      = require('express-session');
 const MongoStore   = require('connect-mongo');
+const rateLimit    = require('express-rate-limit');
 const { MongoClient, ObjectId } = require('mongodb');
 const axios        = require('axios');
 const fs           = require('fs-extra');
@@ -65,34 +66,59 @@ app.use(
     saveUninitialized: false,
     store: MongoStore.create({ mongoUrl: process.env.MONGO_URI }),
     cookie: {
-      // Set secure:true if you add HTTPS termination (Render does TLS)
+      // Render terminates TLS, so mark cookies secure in production
       secure:   process.env.NODE_ENV === 'production',
       httpOnly: true,
+      sameSite: 'lax', // CSRF mitigation — blocks cross-origin state-changing requests
       maxAge:   7 * 24 * 60 * 60 * 1000, // 7 days
     },
   })
 );
+
+// ========================= RATE LIMITERS =============================
+// Strict limit for OAuth initiation — prevents abuse of the consent redirect.
+const authInitLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max:      20,
+  standardHeaders: true,
+  legacyHeaders:   false,
+  message: { error: 'Too many requests, please try again later.' },
+});
+
+// General API limiter for authenticated routes.
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max:      60,
+  standardHeaders: true,
+  legacyHeaders:   false,
+  message: { error: 'Too many requests, please try again later.' },
+});
 
 // ========================= MONGODB INIT ==============================
 let usersCol; // Collection: users
 let logsCol;  // Collection: logs
 
 (async () => {
-  const client = new MongoClient(process.env.MONGO_URI);
-  await client.connect();
-  const db = client.db(); // uses the database name from the MONGO_URI string
-  usersCol = db.collection('users');
-  logsCol  = db.collection('logs');
+  try {
+    const client = new MongoClient(process.env.MONGO_URI);
+    await client.connect();
+    const db = client.db(); // uses the database name from the MONGO_URI string
+    usersCol = db.collection('users');
+    logsCol  = db.collection('logs');
 
-  // Indexes for performance
-  await usersCol.createIndex({ email: 1 }, { unique: true });
-  await logsCol.createIndex({ userId: 1 });
-  await logsCol.createIndex({ timestamp: -1 });
+    // Indexes for performance
+    await usersCol.createIndex({ email: 1 }, { unique: true });
+    await logsCol.createIndex({ userId: 1 });
+    await logsCol.createIndex({ timestamp: -1 });
 
-  console.log('✅ MongoDB connected');
+    console.log('✅ MongoDB connected');
 
-  // Start the scheduler only after DB is ready
-  startScheduler();
+    // Start the scheduler only after DB is ready
+    startScheduler();
+  } catch (err) {
+    console.error('❌ Failed to connect to MongoDB:', err.message);
+    process.exit(1);
+  }
 })();
 
 // ========================= CONSTANTS =================================
@@ -542,6 +568,9 @@ async function runJobForUser(user) {
 // ========================= SCHEDULER =================================
 // Every minute, check all users with autoMode:true and run their job
 // if enough time has elapsed since lastRun based on their schedule interval.
+// inFlightJobs tracks user IDs with an active run to prevent overlapping executions.
+const inFlightJobs = new Set();
+
 function startScheduler() {
   console.log('⏱️  Scheduler started (1-minute tick)');
 
@@ -553,16 +582,26 @@ function startScheduler() {
         // Skip if no YouTube tokens linked
         if (!user.youtubeTokens) continue;
 
+        // Skip if this user already has a job in progress
+        const userIdStr = user._id.toString();
+        if (inFlightJobs.has(userIdStr)) continue;
+
         const intervalMs   = (user.scheduleHours || 24) * 60 * 60 * 1000;
         const lastRun      = user.lastRun ? new Date(user.lastRun).getTime() : 0;
         const nextRunTime  = lastRun + intervalMs;
 
         if (Date.now() >= nextRunTime) {
-          console.log(`⚙️  Scheduler: running job for user ${user._id}`);
-          // Fire and forget — errors are logged inside runJobForUser
-          runJobForUser(user).catch((e) =>
-            console.error(`Scheduler job failed for ${user._id}:`, e.message)
-          );
+          inFlightJobs.add(userIdStr);
+          console.log(`⚙️  Scheduler: running job for user ${userIdStr}`);
+          runJobForUser(user)
+            .catch(async (e) => {
+              console.error(`Scheduler job failed for ${userIdStr}:`, e.message);
+              // Persist failure so it appears in /logs for the user
+              await appendLog(user._id, 'scheduler_error', { message: e.message }).catch(() => {});
+            })
+            .finally(() => {
+              inFlightJobs.delete(userIdStr);
+            });
         }
       }
     } catch (e) {
@@ -585,7 +624,7 @@ function requireAuth(req, res, next) {
 // GET /auth/google
 // Redirects the user to Google's consent screen.
 // Query param `email` is stored in session so we can upsert the user on callback.
-app.get('/auth/google', (req, res) => {
+app.get('/auth/google', authInitLimiter, (req, res) => {
   const oauth2Client = buildOAuth2Client();
   const url = oauth2Client.generateAuthUrl({
     access_type: 'offline',
@@ -603,7 +642,7 @@ app.get('/auth/google', (req, res) => {
 // Google redirects here after consent. We exchange the code for tokens,
 // fetch the user's email from Google, upsert the user in MongoDB, and
 // store userId in the session.
-app.get('/auth/google/callback', async (req, res) => {
+app.get('/auth/google/callback', authInitLimiter, async (req, res) => {
   const { code, error } = req.query;
   if (error) return res.status(400).json({ error: `Google OAuth error: ${error}` });
   if (!code)  return res.status(400).json({ error: 'Missing authorization code' });
@@ -640,6 +679,7 @@ app.get('/auth/google/callback', async (req, res) => {
       { upsert: true, returnDocument: 'after' }
     );
 
+    if (!result) throw new Error('Database upsert returned no result');
     const userId = result._id.toString();
     req.session.userId = userId;
     req.session.email  = email;
@@ -670,7 +710,7 @@ app.post('/auth/logout', (req, res) => {
 // --------------- GET /dashboard ---------------
 // Returns YouTube channel info (name, profile pic, subscribers, total videos)
 // and the last 5 uploaded video details.
-app.get('/dashboard', requireAuth, async (req, res) => {
+app.get('/dashboard', apiLimiter, requireAuth, async (req, res) => {
   try {
     const user = await usersCol.findOne({ _id: new ObjectId(req.session.userId) });
     if (!user) return res.status(404).json({ error: 'User not found' });
@@ -681,7 +721,7 @@ app.get('/dashboard', requireAuth, async (req, res) => {
 
     // Channel info
     const channelRes = await youtube.channels.list({
-      part: ['snippet', 'statistics'],
+      part: ['snippet', 'statistics', 'contentDetails'],
       mine: true,
     });
     const channel    = channelRes.data.items?.[0];
@@ -722,7 +762,7 @@ app.get('/dashboard', requireAuth, async (req, res) => {
 
 // --------------- GET /logs ---------------
 // Returns the last 20 log entries for the authenticated user.
-app.get('/logs', requireAuth, async (req, res) => {
+app.get('/logs', apiLimiter, requireAuth, async (req, res) => {
   try {
     const userId = new ObjectId(req.session.userId);
     const logs   = await logsCol
@@ -741,7 +781,7 @@ app.get('/logs', requireAuth, async (req, res) => {
 // --------------- POST /generate ---------------
 // Manually trigger one video generation + YouTube upload for the logged-in user.
 // Runs synchronously so the client gets the result (or error) in the response.
-app.post('/generate', requireAuth, async (req, res) => {
+app.post('/generate', apiLimiter, requireAuth, async (req, res) => {
   try {
     const user = await usersCol.findOne({ _id: new ObjectId(req.session.userId) });
     if (!user)               return res.status(404).json({ error: 'User not found' });
@@ -758,7 +798,7 @@ app.post('/generate', requireAuth, async (req, res) => {
 // --------------- POST /auto ---------------
 // Enable or disable auto mode and set the schedule interval.
 // Body: { enabled: boolean, scheduleHours: number (e.g. 1, 3, 24) }
-app.post('/auto', requireAuth, async (req, res) => {
+app.post('/auto', apiLimiter, requireAuth, async (req, res) => {
   try {
     const { enabled, scheduleHours } = req.body;
 
@@ -795,7 +835,7 @@ app.post('/auto', requireAuth, async (req, res) => {
 // --------------- POST /disconnect ---------------
 // Revoke the YouTube OAuth tokens and remove them from the DB.
 // The session remains active but the user must re-link YouTube to generate videos.
-app.post('/disconnect', requireAuth, async (req, res) => {
+app.post('/disconnect', apiLimiter, requireAuth, async (req, res) => {
   try {
     const user = await usersCol.findOne({ _id: new ObjectId(req.session.userId) });
     if (!user) return res.status(404).json({ error: 'User not found' });
@@ -825,7 +865,7 @@ app.post('/disconnect', requireAuth, async (req, res) => {
 
 // --------------- GET /profile ---------------
 // Return current user settings (defaultTopic, defaultTheme, autoMode, scheduleHours).
-app.get('/profile', requireAuth, async (req, res) => {
+app.get('/profile', apiLimiter, requireAuth, async (req, res) => {
   try {
     const user = await usersCol.findOne(
       { _id: new ObjectId(req.session.userId) },
@@ -842,7 +882,7 @@ app.get('/profile', requireAuth, async (req, res) => {
 // --------------- PATCH /profile ---------------
 // Update editable user settings.
 // Body (all optional): { defaultTopic, defaultTheme, scheduleHours }
-app.patch('/profile', requireAuth, async (req, res) => {
+app.patch('/profile', apiLimiter, requireAuth, async (req, res) => {
   try {
     const allowed = ['defaultTopic', 'defaultTheme', 'scheduleHours'];
     const update  = {};
@@ -861,7 +901,7 @@ app.patch('/profile', requireAuth, async (req, res) => {
 
 // --------------- DELETE /logs ---------------
 // Clear all logs for the current user.
-app.delete('/logs', requireAuth, async (req, res) => {
+app.delete('/logs', apiLimiter, requireAuth, async (req, res) => {
   try {
     const result = await logsCol.deleteMany({ userId: new ObjectId(req.session.userId) });
     res.json({ success: true, deleted: result.deletedCount });
