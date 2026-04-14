@@ -249,6 +249,7 @@ function buildOAuth2Client() {
 
 async function getAuthenticatedClient(user) {
   if (!user.youtubeTokens) throw new Error('User has no linked YouTube account');
+  if (!user.youtubeTokens.refresh_token) throw new Error('YouTube refresh token is missing. Please reconnect your YouTube account.');
 
   const oauth2Client = buildOAuth2Client();
   oauth2Client.setCredentials(user.youtubeTokens);
