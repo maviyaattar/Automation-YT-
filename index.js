@@ -54,7 +54,10 @@ cloudinary.config({
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors());
+app.use(cors({
+  origin: true,
+  credentials: true
+}));
 app.use(bodyParser.json({ limit: '4mb' }));
 
 // Session middleware — uses MongoDB as the session store so it
@@ -624,11 +627,14 @@ function requireAuth(req, res, next) {
 // GET /auth/google
 // Redirects the user to Google's consent screen.
 // Query param `email` is stored in session so we can upsert the user on callback.
+// ========================= OAUTH ROUTES ==============================
+
+// GET /auth/google
 app.get('/auth/google', authInitLimiter, (req, res) => {
   const oauth2Client = buildOAuth2Client();
   const url = oauth2Client.generateAuthUrl({
     access_type: 'offline',
-    prompt:      'consent',
+    prompt: 'consent',
     scope: [
       'https://www.googleapis.com/auth/youtube.upload',
       'https://www.googleapis.com/auth/youtube.readonly',
@@ -639,70 +645,78 @@ app.get('/auth/google', authInitLimiter, (req, res) => {
 });
 
 // GET /auth/google/callback
-// Google redirects here after consent. We exchange the code for tokens,
-// fetch the user's email from Google, upsert the user in MongoDB, and
-// store userId in the session.
 app.get('/auth/google/callback', authInitLimiter, async (req, res) => {
   const { code, error } = req.query;
   if (error) return res.status(400).json({ error: `Google OAuth error: ${error}` });
-  if (!code)  return res.status(400).json({ error: 'Missing authorization code' });
+  if (!code) return res.status(400).json({ error: 'Missing authorization code' });
 
   try {
-    const oauth2Client       = buildOAuth2Client();
-    const { tokens }         = await oauth2Client.getToken(code);
+    const oauth2Client = buildOAuth2Client();
+    const { tokens } = await oauth2Client.getToken(code);
     oauth2Client.setCredentials(tokens);
 
-    // Fetch email from Google
-    const oauth2Api  = google.oauth2({ version: 'v2', auth: oauth2Client });
-    const { data }   = await oauth2Api.userinfo.get();
-    const email      = data.email;
+    // Fetch email
+    const oauth2Api = google.oauth2({ version: 'v2', auth: oauth2Client });
+    const { data } = await oauth2Api.userinfo.get();
+    const email = data.email;
     if (!email) throw new Error('Could not retrieve email from Google');
 
-    // Upsert user in DB
+    // Save user
     const result = await usersCol.findOneAndUpdate(
       { email },
       {
         $set: {
           email,
           youtubeTokens: tokens,
-          updatedAt:     new Date(),
+          updatedAt: new Date(),
         },
         $setOnInsert: {
           defaultTopic: 'islamic',
           defaultTheme: 'paper',
-          autoMode:     false,
+          autoMode: false,
           scheduleHours: 24,
-          lastRun:      null,
-          createdAt:    new Date(),
+          lastRun: null,
+          createdAt: new Date(),
         },
       },
       { upsert: true, returnDocument: 'after' }
     );
 
-    if (!result) throw new Error('Database upsert returned no result');
     const userId = result._id.toString();
     req.session.userId = userId;
-    req.session.email  = email;
+    req.session.email = email;
 
-    res.json({ success: true, message: 'YouTube account linked', email });
+    // ✅ FIX: Redirect instead of JSON
+    res.redirect('/');
+
   } catch (err) {
     console.error('OAuth callback error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// GET /auth/status — check whether the current session is authenticated
+// GET /auth/status
 app.get('/auth/status', (req, res) => {
   if (req.session && req.session.userId) {
-    res.json({ authenticated: true, email: req.session.email });
+    res.json({
+      authenticated: true,
+      user: {
+        email: req.session.email,
+        name: req.session.email?.split('@')[0] || 'User',
+        avatar: null
+      }
+    });
   } else {
     res.json({ authenticated: false });
   }
 });
 
-// POST /auth/logout — destroy session
+// POST /auth/logout
 app.post('/auth/logout', (req, res) => {
-  req.session.destroy(() => res.json({ success: true, message: 'Logged out' }));
+  req.session.destroy(() => {
+    res.clearCookie('connect.sid');
+    res.json({ success: true, message: 'Logged out' });
+  });
 });
 
 // ========================= API ROUTES ================================
