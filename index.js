@@ -687,7 +687,7 @@ app.get('/auth/google/callback', authInitLimiter, async (req, res) => {
     req.session.email = email;
 
     // ✅ FIX: Redirect instead of JSON
-    res.redirect('autoyt-xi.vercel.app');
+    res.redirect('https://autoyt-xi.vercel.app');
 
   } catch (err) {
     console.error('OAuth callback error:', err.message);
