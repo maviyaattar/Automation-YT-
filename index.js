@@ -16,6 +16,15 @@ const { spawn } = require('child_process');
 const { google } = require('googleapis');
 const cloudinary = require('cloudinary').v2;
 
+// ========================= MODULAR IMPORTS ===========================
+// Clean-structure modules (routes, middleware, db)
+const db = require('./db');
+const authRouter = require('./routes/auth');
+const profileRouter = require('./routes/profile');
+const logsRouter = require('./routes/logs');
+const generateRouter = require('./routes/generate');
+const workerRouter = require('./routes/worker');
+
 // ========================= ENV VALIDATION ============================
 const REQUIRED_ENV = [
   'GOOGLE_CLIENT_ID',
@@ -27,6 +36,7 @@ const REQUIRED_ENV = [
   'MONGO_URI',
   'SESSION_SECRET',
   'GROQ_API_KEY',
+  'WORKER_SECRET',
 ];
 
 for (const key of REQUIRED_ENV) {
@@ -101,22 +111,16 @@ const apiLimiter = rateLimit({
 });
 
 // ========================= MONGODB INIT ==============================
+// Shared db module initialises the connection and exposes collection
+// getters used by the modular route files.
 let usersCol;
 let logsCol;
 
 (async () => {
   try {
-    const client = new MongoClient(process.env.MONGO_URI);
-    await client.connect();
-    const db = client.db();
-    usersCol = db.collection('users');
-    logsCol = db.collection('logs');
-
-    await usersCol.createIndex({ email: 1 }, { unique: true });
-    await logsCol.createIndex({ userId: 1 });
-    await logsCol.createIndex({ timestamp: -1 });
-
-    console.log('✅ MongoDB connected');
+    await db.connect();
+    usersCol = db.getUsersCol();
+    logsCol = db.getLogsCol();
 
     startScheduler();
   } catch (err) {
@@ -607,6 +611,8 @@ function startScheduler() {
 }
 
 // ========================= AUTH MIDDLEWARE ===========================
+// Kept here so the remaining legacy routes (/dashboard, /auto, /disconnect)
+// can continue to use it without importing the middleware module.
 function requireAuth(req, res, next) {
   if (!req.session || !req.session.userId) {
     return res.status(401).json({ error: 'Not authenticated. Please login via /auth/google' });
@@ -614,108 +620,14 @@ function requireAuth(req, res, next) {
   next();
 }
 
-// ========================= OAUTH ROUTES ==============================
-
-// GET /auth/google
-app.get('/auth/google', authInitLimiter, (req, res) => {
-  const oauth2Client = buildOAuth2Client();
-  const url = oauth2Client.generateAuthUrl({
-    access_type: 'offline',
-    prompt: 'consent',
-    scope: [
-      'https://www.googleapis.com/auth/youtube.upload',
-      'https://www.googleapis.com/auth/youtube.readonly',
-      'https://www.googleapis.com/auth/userinfo.email',
-    ],
-  });
-  res.redirect(url);
-});
-
-// GET /auth/google/callback
-app.get('/auth/google/callback', authInitLimiter, async (req, res) => {
-  const { code, error } = req.query;
-  if (error) return res.status(400).json({ error: `Google OAuth error: ${error}` });
-  if (!code) return res.status(400).json({ error: 'Missing authorization code' });
-
-  try {
-    const oauth2Client = buildOAuth2Client();
-    const { tokens } = await oauth2Client.getToken(code);
-    oauth2Client.setCredentials(tokens);
-
-    const oauth2Api = google.oauth2({ version: 'v2', auth: oauth2Client });
-    const { data } = await oauth2Api.userinfo.get();
-    const email = data.email;
-    if (!email) throw new Error('Could not retrieve email from Google');
-
-    const result = await usersCol.findOneAndUpdate(
-      { email },
-      {
-        $set: {
-          email,
-          youtubeTokens: tokens,
-          updatedAt: new Date(),
-        },
-        $setOnInsert: {
-          defaultTopic: 'islamic',
-          defaultTheme: 'paper',
-          autoMode: false,
-          scheduleHours: 24,
-          lastRun: null,
-          createdAt: new Date(),
-        },
-      },
-      { upsert: true, returnDocument: 'after' }
-    );
-
-    // mongodb driver returns { value } for findOneAndUpdate
-    const userDoc = result?.value || result;
-    const userId = userDoc?._id?.toString();
-    if (!userId) throw new Error('Failed to resolve userId after upsert');
-
-    req.session.userId = userId;
-    req.session.email = email;
-
-    console.log('SESSION:', req.session);
-
-    // Ensure session is persisted before redirect (prevents lost session after OAuth)
-    req.session.save((err) => {
-      if (err) {
-        console.error('Session save error:', err.message);
-        return res.status(500).json({ error: 'Failed to persist session' });
-      }
-      res.redirect('https://autoyt-xi.vercel.app');
-    });
-  } catch (err) {
-    console.error('OAuth callback error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// GET /auth/status
-app.get('/auth/status', (req, res) => {
-  console.log('SESSION:', req.session);
-
-  if (req.session && req.session.userId) {
-    res.json({
-      authenticated: true,
-      user: {
-        email: req.session.email,
-        name: req.session.email?.split('@')[0] || 'User',
-        avatar: null,
-      },
-    });
-  } else {
-    res.json({ authenticated: false });
-  }
-});
-
-// POST /auth/logout
-app.post('/auth/logout', (req, res) => {
-  req.session.destroy(() => {
-    res.clearCookie('connect.sid');
-    res.json({ success: true, message: 'Logged out' });
-  });
-});
+// ========================= MODULAR ROUTERS ===========================
+// Clean-structure routes (auth, profile, logs, generate, worker).
+// These replace the previously-inline versions of the same endpoints.
+app.use('/auth', authRouter);
+app.use('/profile', profileRouter);
+app.use('/logs', logsRouter);
+app.use('/generate', generateRouter);
+app.use('/worker', workerRouter);
 
 // ========================= API ROUTES ================================
 
@@ -763,32 +675,6 @@ app.get('/dashboard', apiLimiter, requireAuth, async (req, res) => {
     });
   } catch (err) {
     console.error('/dashboard error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/logs', apiLimiter, requireAuth, async (req, res) => {
-  try {
-    const userId = new ObjectId(req.session.userId);
-    const logs = await logsCol.find({ userId }).sort({ timestamp: -1 }).limit(20).toArray();
-    res.json({ logs });
-  } catch (err) {
-    console.error('/logs error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/generate', apiLimiter, requireAuth, async (req, res) => {
-  try {
-    const user = await usersCol.findOne({ _id: new ObjectId(req.session.userId) });
-    if (!user) return res.status(404).json({ error: 'User not found' });
-    if (!user.youtubeTokens)
-      return res.status(400).json({ error: 'YouTube not connected. Link your account first.' });
-
-    const result = await runJobForUser(user);
-    res.json({ success: true, videoId: result.videoId, quote: result.quote });
-  } catch (err) {
-    console.error('/generate error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -848,47 +734,6 @@ app.post('/disconnect', apiLimiter, requireAuth, async (req, res) => {
     res.json({ success: true, message: 'YouTube account disconnected' });
   } catch (err) {
     console.error('/disconnect error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/profile', apiLimiter, requireAuth, async (req, res) => {
-  try {
-    const user = await usersCol.findOne(
-      { _id: new ObjectId(req.session.userId) },
-      { projection: { youtubeTokens: 0 } }
-    );
-    if (!user) return res.status(404).json({ error: 'User not found' });
-    res.json({ profile: user });
-  } catch (err) {
-    console.error('/profile error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.patch('/profile', apiLimiter, requireAuth, async (req, res) => {
-  try {
-    const allowed = ['defaultTopic', 'defaultTheme', 'scheduleHours'];
-    const update = {};
-    for (const key of allowed) {
-      if (req.body[key] !== undefined) update[key] = req.body[key];
-    }
-    update.updatedAt = new Date();
-
-    await usersCol.updateOne({ _id: new ObjectId(req.session.userId) }, { $set: update });
-    res.json({ success: true, updated: update });
-  } catch (err) {
-    console.error('PATCH /profile error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.delete('/logs', apiLimiter, requireAuth, async (req, res) => {
-  try {
-    const result = await logsCol.deleteMany({ userId: new ObjectId(req.session.userId) });
-    res.json({ success: true, deleted: result.deletedCount });
-  } catch (err) {
-    console.error('DELETE /logs error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
