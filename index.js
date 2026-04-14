@@ -682,19 +682,38 @@ app.get('/dashboard', apiLimiter, requireAuth, async (req, res) => {
 
 app.post('/auto', apiLimiter, requireAuth, async (req, res) => {
   try {
-    const { enabled, scheduleHours } = req.body;
+    const { enabled } = req.body;
 
     if (typeof enabled !== 'boolean') {
       return res.status(400).json({ error: '`enabled` (boolean) is required' });
     }
 
-    const update = {
+    const user = await usersCol.findOne({ _id: new ObjectId(req.session.userId) });
+
+    const postsPerDay = user.postsPerDay || 1;
+    const scheduleHours = 24 / postsPerDay;
+
+    await usersCol.updateOne(
+      { _id: user._id },
+      {
+        $set: {
+          autoMode: enabled,
+          scheduleHours,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    res.json({
+      success: true,
       autoMode: enabled,
-      updatedAt: new Date(),
-    };
-    if (typeof scheduleHours === 'number' && scheduleHours > 0) {
-      update.scheduleHours = scheduleHours;
-    }
+      scheduleHours,
+    });
+  } catch (err) {
+    console.error('/auto error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 
     await usersCol.updateOne({ _id: new ObjectId(req.session.userId) }, { $set: update });
 
